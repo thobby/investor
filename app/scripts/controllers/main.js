@@ -1,10 +1,18 @@
-'use strict';
-
 angular.module('investorApp')
-  .controller('MainCtrl', function ($scope) {
-    $scope.awesomeThings = [
-      'HTML5 Boilerplate',
-      'AngularJS',
-      'Karma'
-    ];
-  });
+  .controller('MainCtrl', ['$log', '$http', '$scope',
+      function ($log, $http, $scope) {
+      'use strict';
+
+      $http(
+        {
+          method: "GET",
+          url: "/linearRegression"
+        }
+      ).success(function (data) {
+        // $log.debug('Linear regression response: ' + data);
+        $scope.linearRegression = data;
+      }).error(function (data) {
+        $log.error("Error ");
+      });
+      $scope.gridOptions = { data: 'linearRegression' };
+    }]);
