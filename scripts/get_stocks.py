@@ -9,6 +9,7 @@ import sys
 import ystockquote
 import datetime
 import concurrent.futures
+import urllib
 from io import StringIO
 from pprint import pprint
 
@@ -76,7 +77,7 @@ class db:
 
   def open_connection(self):
     logger.debug("Opening connection to DB %s", self.file)
-    self.conn = sqlite3.connect(self.file)
+    self.conn = sqlite3.connect(self.file, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
     self.cur = self.conn.cursor()
 
   def close_connection(self):
@@ -94,7 +95,6 @@ class db:
         self.conn.execute('insert into tickers(id, exchange, name) values (null, ?, ?);', (exchange.id, ticker))
       else:
         logger.debug("Ticker %s is already in the db", ticker)
-
 
   def update_data(self, symbol, data):
     id = self.get_id_for_symbol(symbol)
@@ -200,94 +200,118 @@ class db:
       return id[0]
     return id
 
+  def get_last_datum(self, symbol):
+    self.cur.execute('select max(datum) from data, tickers'
+                     ' where tickers.id = data.ticker and tickers.symbol = ?',
+                    (symbol,))
+    max_datum = self.cur.fetchone()
+    if max_datum[0] is None:
+      # We only get stock date from 2007
+      return datetime.datetime(2007, 1, 1, 0, 0, 0)
+    return datetime.datetime.strptime(max_datum[0], '%Y-%m-%d')
+
   def get_symbols(self):
-    self.cur.execute('select symbol from tickers')
+    self.cur.execute('select symbol from tickers order by symbol')
     symbols = []
     for s in self.cur.fetchall():
       symbols.append(s[0])
     return symbols
 
-db = db()
-db.open_connection()
 
-nyse_csv = requests.get('http://www.nyse.com/indexes/nyaindex.csv')
-if nyse_csv.status_code != 200:
-  logger.error('Can not download symbols from NYSE %s', nyse_csv.status_code)
-  exit()
-
-nyse = StringIO(nyse_csv.text)
-reader = csv.reader(nyse, delimiter=',')
-i = 0
-for row in reader:
-  if i < 2:
-    # Skip first two rows they are just headers
-    i += 1
-    continue
-  # Row format: "Name", "Symbol", "Country", "ICB", "INDUS", "SUP SEC", "SEC", "SUB SEC"
-  #               0        1          2        3       4         5        6        7
-  # Note: Sector on NYSE and on NASDAQ have a bit different meaning
-  if db.get_id_for_symbol(row[1]) is not None:
-      # We already have this ticker in the DB
-      logger.debug('Ticker %s already in DB', row[0])
-      continue
-
-  # Create ticker in the database
-  id = db.create_ticker('nyse', row[1], row[0], 'N/A', 'N/A', row[2], 'N/A', row[4], row[6], 'N/A')
-
-  logger.info('Created ticker id %d', id)
-
-  # Get ticker detail information
-  ticker_info = ystockquote.get_all(row[1])
-
-  # Create ticker detail information
-  db.create_ticker_info(id, datetime.datetime.now(), ticker_info)
-  db.conn.commit()
-
-tickers = []
-with open('nasdaq.csv', 'r') as csvfile:
-  reader = csv.reader(csvfile, delimiter=',')
-  for row in reader:
-    # Row format: "Symbol","Name","LastSale","MarketCap","ADR TSO","Country", "IPOyear","Sector","industry","Summary Quote",
-    #                0        1       2           3          4         5        6         7             8      9
-    if db.get_id_for_symbol(row[0]) is not None:
-      # We already have this ticker in the DB
-      logger.debug('Ticker %s already in DB', row[0])
-      continue
-
-    # Create ticker in the database
-    id = db.create_ticker('nasdaq', row[0], row[1], row[3], row[4], row[5], row[6], row[7], row[8], row[9])
-
-    logger.info('Created ticker id %d', id)
-
-    # Get ticker detail information
-    ticker_info = ystockquote.get_all(row[0])
-
-    # Create ticker detail information
-    db.create_ticker_info(id, datetime.datetime.now(), ticker_info)
-    db.conn.commit()
-
-def update_symbol(symbol):
-  logger.info("Updating %s", symbol)
+def update_symbol_from_date(arg):
+  symbol = arg[0];
+  from_datum = arg[1];
+  logger.debug('Getting %s from %s', symbol, from_datum)
+  today = datetime.datetime.today().strftime('%Y-%m-%d')
+  if today == from_datum:
+    return (symbol, "")
   try:
-    return ystockquote.get_historical_prices(symbol, "2007-01-01", "2015-01-01")
+    return (symbol, ystockquote.get_historical_prices(symbol, from_datum, "2015-01-01"))
+  except urllib.error.HTTPError:
+    type, value, traceback = sys.exc_info()
+    logger.warn('Getting %s from Yahoo failed: %s', symbol, value)
+    return (symbol, "")
   except:
     type, value, traceback = sys.exc_info()
     logger.warning("Getting %s from Yahoo failed %s %s %s", symbol, value, type, traceback)
     raise
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-  # Update all tickers with the newest stock prices
-  future_update = {executor.submit(update_symbol, symbol):
-                    symbol for symbol in db.get_symbols()}
-  for future in concurrent.futures.as_completed(future_update):
-    symbol = future_update[future]
-    try:
-      data = future.result()
-    except Exception as exc:
-      logger.error('%s update generated an exception: %s' % (symbol, exc))
-    else:
-      logger.debug('Saving symbol %s update in DB', symbol)
-      db.update_data(symbol, data)
+if __name__ == "__main__":
+  db = db()
+  db.open_connection()
+
+  nyse_csv = requests.get('http://www.nyse.com/indexes/nyaindex.csv')
+  if nyse_csv.status_code != 200:
+    logger.error('Can not download symbols from NYSE %s', nyse_csv.status_code)
+    exit()
+
+  nyse = StringIO(nyse_csv.text)
+  reader = csv.reader(nyse, delimiter=',')
+  i = 0
+  for row in reader:
+    if i < 2:
+      # Skip first two rows they are just headers
+      i += 1
+      continue
+    # Row format: "Name", "Symbol", "Country", "ICB", "INDUS", "SUP SEC", "SEC", "SUB SEC"
+    #               0        1          2        3       4         5        6        7
+    # Note: Sector on NYSE and on NASDAQ have a bit different meaning
+    if db.get_id_for_symbol(row[1]) is not None:
+      # We already have this ticker in the DB
+      logger.debug('Ticker %s already in DB', row[0])
+      continue
+
+    # Create ticker in the database
+    id = db.create_ticker('nyse', row[1], row[0], 'N/A', 'N/A', row[2], 'N/A', row[4], row[6], 'N/A')
+
+    logger.info('Created ticker id %d', id)
+
+    # Get ticker detail information
+    ticker_info = ystockquote.get_all(row[1])
+
+    # Create ticker detail information
+    db.create_ticker_info(id, datetime.datetime.now(), ticker_info)
+    db.conn.commit()
+
+  tickers = []
+  with open('nasdaq.csv', 'r') as csvfile:
+    reader = csv.reader(csvfile, delimiter=',')
+    for row in reader:
+      # Row format: "Symbol","Name","LastSale","MarketCap","ADR TSO","Country", "IPOyear","Sector","industry","Summary Quote",
+      #                0        1       2           3          4         5        6         7             8      9
+      if db.get_id_for_symbol(row[0]) is not None:
+        # We already have this ticker in the DB
+        logger.debug('Ticker %s already in DB', row[0])
+        continue
+
+      # Create ticker in the database
+      id = db.create_ticker('nasdaq', row[0], row[1], row[3], row[4], row[5], row[6], row[7], row[8], row[9])
+
+      logger.info('Created ticker id %d', id)
+
+      # Get ticker detail information
+      ticker_info = ystockquote.get_all(row[0])
+
+      # Create ticker detail information
+      db.create_ticker_info(id, datetime.datetime.now(), ticker_info)
       db.conn.commit()
 
-db.close_connection()
+  with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    try:
+      # Update all tickers with the newest stock prices
+      for (symbol, data) in \
+        executor.map(update_symbol_from_date,
+                     [(symbol, (db.get_last_datum(symbol) + datetime.timedelta(days=1)).strftime('%Y-%m-%d'))
+                      for symbol in db.get_symbols()]):
+        logger.debug('Saving symbol %s update in DB', symbol)
+        if data == "":
+          logger.info('Not updating %s it is up-to-date', symbol)
+          continue
+        db.update_data(symbol, data)
+        db.conn.commit()
+    except:
+      type, value, traceback = sys.exc_info()
+      logger.warning("Exception occurred during DB update (type: %s, value: %s, traceback: %s)", type, value, traceback)
+      raise
+
+  db.close_connection()
